@@ -1,0 +1,641 @@
+import random
+import time
+import sys
+
+# ----
+# Params
+# ----
+
+NUM_INIT_NODE = 10   # Churn rate 0.03 * 33 init nodes = 1 churn event allowed at start
+NUM_OPERATIONS = 10  # num operations the simulator should schedule
+
+# Parameter set: alpha 0.03, delta 0.13, gamma 0.7, beta 0.726
+
+BETA = 0.726    #% of nodes believed to be joined (members)
+GAMMA = 0.70    #% of nodes believed to be present (not necessarily joined)
+ALPHA = 0.03    #Churn rate
+DELTA = 0.13       #failure fraction / Max % of nodes that can be crashed
+
+# ----
+# Randomized delays
+# ----
+
+MIN_TIME_TO_NEXT_OP = 0.5
+MAX_TIME_TO_NEXT_OP = 1
+#In the scheduler/simulator,
+#the min/max amount of real time to wait until triggering another operation/event
+
+# Maximum message delay: defined as D in the paper, DELAY in the code.
+# We consider maximum message delay
+# To be the sum of (real_message_delay) + (a random amount of padding).
+# We only care about delays in between node-node communication;
+# not delays in between node-scheduler communication
+# cause the scheduler isn't a real entity in the algorithm itself.
+
+# D is used by the algorithm,
+# To determine how long the 'sliding window' for past churn events should be.
+# We want DELAY to be big enough so the sliding window of churn history
+# can capture recent churn events,
+# But small enough that the program doesn't stall forever.
+
+# Padding is a random amount of time (from 0 to PADDING) added onto 
+# node-node communications.
+# The purpose of padding is to introduce variance,
+# so not all messages take the same time
+# (if they all took the same time it'd be less randomized,
+# so less like a realistic environment).
+
+# Real_message_delay is how long it takes a single message to 
+# transmit from one node to another.
+
+# In practice real_message_delay can vary significantly;
+# Running only 10 nodes as processes had a negligible delay;
+# but running 50 nodes as threads on compute.cse
+# makes read/write operations take 7-10 seconds, 
+# implying the message delay takes longer 
+# (more message congestion? thread implementation? not sure why).
+
+# Because I'm not sure what real_message_delay will be for certain,
+# and it's a non-negligible quantity,
+# we heuristically calculate real_message_delay by 
+# doing several reads (with no padding), timing how long these reads take,
+# then taking the average read time and dividing by 4.
+# (Why 4? The total runtime is 4*D because of two round trips.
+# The read phase is 2*D, the write phase is 2*D).
+
+PADDING = 2
+
+# ----
+# Other comments
+# ----
+
+#for clarification: events and operations are the same thing,
+#each scheduler event triggers one operation on the system
+
+#scheduler and simulator are the same thing,
+#the simulator schedules/invokes/starts each event
+
+#Flags: TODO, ASKABOUT, NEW, 
+#RIGGED (code which changes algo behavior on purpose, to test a particular code branch)
+
+# ----------------------------------------
+# Node class
+# ----------------------------------------
+
+class Node (process):
+    #Initializes a node. Can be thought of as a constructor. Should be called first.
+    def setup(known_nodes, scheduler):
+        # for initial node, known_nodes is all the other initial nodes; 
+        # otherwise it is empty set
+        #scheduler is the master simulator thread, which has perfect knowledge 
+        #of the system
+
+        # **** variables for managing churn ****
+        self.is_joined = bool(known_nodes) # whether node has joined the system
+        self.join_bound = 0 # number of enter-echo msgs to receive before joining
+        self.join_counter = 0 # number of enter-echo messages currently received
+        self.Changes = (setof(('enter',q), q in known_nodes) | 
+                        setof(('join',q), q in known_nodes))  
+                        # set of ENTER, LEAVE, and JOINED events known to node 
+                        # either blank (knows nothing) or knows all other initial nodes
+        
+        # if self is one of the initial nodes, it knows the other initial nodes
+        if (known_nodes):  
+            Changes.add(('enter',self))
+            Changes.add(('join',self))
+
+        # *** variables for managing churn and reading/writing simulated register
+        self.val = None # latest register value known to node
+        self.num = 0 # sequence number of latest value known to node
+        self.w_id = None  # id of node that wrote latest value known to node
+
+        # **** variables for reading/writing simulated register ****
+        self.temp = 0 # temporary storage for value being read or written
+        self.tag = 0  # uniquely identify read and write phases of an operation
+        self.rw_bound = 0 # number of replies/acks needed to finish a phase
+        self.rw_counter = 0  # number of replies/acks received for phase
+        self.rp_pending = False # whether a read phase is in progress
+        self.wp_pending = False # whether a write phase is in progress
+        self.read_pending = False #  whether a read operation is in progress
+        self.write_pending = False # whether a write operation is in progress
+
+        # code for node entering the system AFTER initial time, in response
+        # to receiving enter-signal message from scheduler
+        if known_nodes == set():
+            Changes.add(('enter',self))
+            bcast('enter', self)
+            #output('entered, bcasted enter msgs')
+            
+            
+        # Create a local randomizer so multiple Random calls dont share state
+        self.localRandom = random.Random()
+        # Optional: seed local_random if desired
+        
+        self.stallingEnabled = False
+        #By default a node starts with stall() disabled;
+        #this is so we can accurately measure real-time message delays
+        #without our manually induced delays (see note at top of file).
+        
+    # ********** end of Node setup method 
+
+    # broadcast is actually performed by scheduler which has perfect global
+    # knowledge of which nodes are present in the system
+    def bcast(*m):
+        send(('bcast',m), to=scheduler)
+        
+    # **** helper method for simulating random message delays
+    def stall():
+        if stallingEnabled:
+            waitTime = localRandom.uniform(0,PADDING)
+            if await(False): pass
+            elif timeout(waitTime): 
+                #output("DEBUG -- stall timeout for node", self)
+                pass
+                
+    
+    #Method which enables stalling.
+    #By default a node starts with stall() disabled;
+    #this is so we can accurately measure real-time message delays
+    #without our manually induced delays (see note at top of file).
+    def receive(msg = "enable stalling"):
+        output("Stalling Enabled")
+        self.stallingEnabled = True
+    
+    # ***************** methods for managing the churn ******************
+
+    # set of nodes that p believes are currently present (entered but not left) 
+    def Present():
+        return setof(q, ('enter',q) in Changes, ('leave',q) not in Changes)
+
+    def receive(msg = ('enter',p)):
+        stall() 
+        Changes.add(('enter',p))
+        bcast('enter-echo', Changes, (val, num, w_id), is_joined, p)
+
+    def receive(msg = ('enter-echo', C, (v, s, i), j, p)):
+        stall()
+        if (s, i) > (num, w_id, id):
+            val, num, w_id = v, s, i
+        Changes = Changes | C
+        if (not is_joined) and (p == self):
+            if (j == True) and (join_bound == 0):
+                join_bound = GAMMA * len(Present())
+                #output('join_bound set to', join_bound, 'based on Present size of', len(Present()))
+            join_counter += 1
+            if (join_counter >= join_bound) and (join_bound > 0):
+                is_joined = True
+                #output('joined')
+                Changes.add(('join',self))
+                send(('joined'), to=scheduler) # tell scheduler I've joined
+                bcast('joined',self)
+
+    def receive(msg = ('joined', p)):
+        stall()
+        Changes.add(('join',p))
+        Changes.add(('enter',p))
+        bcast('joined-echo',p)
+
+    def receive(msg = ('joined-echo',p)):
+        stall()
+        Changes.add(('join',p))
+        Changes.add(('enter',p))
+
+    # node leaves system (as a churn event) 
+    # in response to 'leave-signal' msg from scheduler
+    def receive(msg = ('leave-signal')): 
+        #output('received leave signal, exiting')
+        bcast('leave', self)
+        #output('exiting')
+        exit()
+
+    def receive(msg = ('leave',p)):
+        stall()
+        Changes.add(('leave',p))
+        bcast('leave-echo',p)
+        #output('received leave message from node',p,'Changes set is',Changes)
+
+    def receive(msg = ('leave-echo',p)):
+        stall()
+        Changes.add(('leave',p))
+
+    # ***************** methods for simulating reads and writes **************
+
+    # set of nodes that p believes are currently members (joined but not left) 
+    def Members():
+        return setof(q, ('join',q) in Changes, ('leave',q) not in Changes)
+
+    #Scheduler kicks off a read event
+    def receive(msg='read'):
+        #output('read invoked')
+        read_pending = True
+        begin_read_phase()
+    
+    #Scheduler kicks off a write event
+    def receive(msg = ('write', v)):
+        #output('write invoked, value:', v)
+        write_pending = True
+        temp = v
+        begin_read_phase()
+
+    def begin_read_phase():
+        #output('begin read phase')
+        tag += 1
+        bcast('query', tag, self)
+        rw_bound = BETA * len(Members())
+        #output('rw_bound set to', rw_bound, 'based on Members size of', len(Members()))
+        rw_counter = 0
+        rp_pending = True
+
+    def receive(msg = ('reply', (v, s, i), rt, p)):
+        stall()
+        #output('====reply', rt)
+        if rp_pending and (rt == tag) and (p==self):
+            if (s, i) > (num, w_id):
+                val, num, w_id = v, s, i
+            rw_counter += 1
+            if (rw_counter >= rw_bound):
+                rp_pending = False
+                begin_write_phase()
+
+    def begin_write_phase():
+        #output('begin write phase')
+        if write_pending:
+            val = temp
+            num += 1
+            w_id = self
+        if read_pending:
+            temp = val
+        bcast('update', (temp, num, w_id), tag, self)
+        rw_counter = 0
+        wp_pending = True
+
+    def receive(msg = ('ack',wt,p)):
+        stall()
+        if wp_pending and (wt == tag) and (p == self):
+            rw_counter += 1
+            if (rw_counter >= rw_bound):
+                wp_pending = False
+                if (read_pending):
+                    read_pending = False
+                    send(('return',temp), to=scheduler)
+                if (write_pending):
+                    write_pending = False
+                    send('ack', to=scheduler)
+                    
+    # ***** "server" code follows ****
+    #Server as defined in the paper. It's not the scheduler.
+
+    def receive(msg= ('update', (v, s, i), wt, q)):
+        stall()
+        if w_id == None or (s, i) > (num, w_id):
+            val, num, w_id = v, s, i
+        if is_joined:
+            bcast('ack', wt, q)
+        bcast('update-echo', (val, num, w_id))
+
+    def receive(msg = ('query', rt, p)):
+        stall()
+        #print('====query', p, is_joined)
+        if is_joined:
+            #print('====query', p)
+            bcast('reply', (val, num, w_id), rt, p)
+
+    def receive(msg = ('update-echo', (v, s, i))):
+        stall()
+        if (s, i) > (num, w_id):
+            val, num, w_id = v, s, i
+
+    #This is just for the scheduler to end nodes, not node-node communication
+    def receive(msg= 'end-sim'): 
+        output('exiting by end-sim')
+        exit()
+
+# ********** run *******************************
+
+    def run():
+        #output(self, 'running')
+        await(False) 
+        #output('node', self, 'at end of run')
+
+
+# ----------------------------------------
+# Scheduler class
+# ----------------------------------------
+
+class Scheduler (process):
+    def setup():
+        #Nodes is implemented as a python Set of processIds
+        self.nodes = new(Node, num=NUM_INIT_NODE)
+        #Nodes contains ALL nodes (even the ones we've crashed, or that are busy)
+        
+        self.crashed = set() 
+
+        #Push nodes to the busy set if they're busy,
+        #On receiving ack, remove from busy set        
+        self.busy = set()
+        
+        #Logs all churn events thru simulator execution
+        #Event: a tuple of (time, system size after churn event)
+        self.churnHistory = []
+        
+        #Setup/initialize all the processes in Nodes
+        for p in nodes:
+            setup(p, [nodes-{p}, self])
+        start(nodes)
+        
+        self.replies = set()
+        
+        # Create local randomizer so random doesnt share state
+        self.localRandom = random.Random()
+        
+        #Bookeeping to count # of events finished
+        self.numEvents = 0
+        
+        #Bookkeeping so each write has a unique value
+        self.writeValue = 0 
+        
+        #Initialize self.DELAY = 0, but change it
+        #Once we've finished calibrating what DELAY should be,
+        #based on the average realtime for a read operation to complete
+        self.DELAY = 0
+    
+    def calculateChurnAllowed():
+        #Get the past X events that have happened since D seconds ago
+        now = time.time()
+        #Grab events in churn history that are < DELAY ago
+        recentChurns = [event for event in churnHistory if (now - event[0]) < DELAY]
+        recentChurns.reverse() #sort by most recent first
+        
+        output("[calculateChurnAllowed] recentChurns", str(recentChurns))
+        
+        #[NEW] Special case: If there are no recent churns,
+        #We still check if churn is allowed.
+        #The check is based on current system size N(t)
+        #(Note N(t) = N(t-D) because no churns have happened)
+        if len(recentChurns) == 0:
+            numChurns = 1 #1 proposed churn event at current time
+            sysSize = len(nodes)
+            potentialChurnPercent = numChurns / len(nodes)
+            output("[calculateChurnAllowed] potential churn%", numChurns, "/", 
+                   sysSize, "=", potentialChurnPercent, "|", "alpha=", ALPHA)
+            
+            if potentialChurnPercent > ALPHA:
+                return False
+            
+        
+        #Default case
+        #For EVERY ONE of these events, check if a churn now
+        #Would violate the churn assumption for past event
+        #(note: if 0 churns, as with the Special case, 
+        #this for loop is skipped)
+        churnAllowed = True
+        for index, churn in enumerate(recentChurns, 1):
+            numChurns = index + 1   #Index = # of churn events in the past (1-indxed),
+                                    #+1 to add the hypothetical churn event at current time
+            sysSize = churn[1]      #Historical system size, not current
+            potentialChurnPercent = numChurns/sysSize
+            output("[calculateChurnAllowed] potential churn%", numChurns, "/", 
+                   sysSize, "=", potentialChurnPercent, "|", "alpha=", ALPHA)
+            if potentialChurnPercent > ALPHA:
+                churnAllowed = False
+                break
+
+        return churnAllowed
+    
+    def calculateCrashAllowed():
+        #Calc if an additional crash will exceed the DELTA threshhold
+        if len(nodes) == 0:
+            potentialCrashPercent = 1
+        else:
+            potentialCrashPercent = (len(crashed)+1)/len(nodes)
+        output("[calculateCrashAllowed] Potential Crashed%", 
+               str(potentialCrashPercent)[:5], "delta=", DELTA)
+        return (potentialCrashPercent < DELTA)
+    
+    
+    #Part 2 of bcast -- scheduler fwds msg to other nodes
+    def receive(msg = ('bcast',m)):
+        send(m, to = nodes-crashed)
+        
+    
+    def calibrateDelay():
+        # Calibrate DELAY value based on how long an average operation takes
+        # on this particular computer
+        operationTimes = []
+        for i in range(2):
+            startTime = time.time()
+            target = random.choice(list(nodes - crashed))
+            do_read(target)
+            await(some(received(('return',temp), from_=_target, clk=c),
+                 has= (('return',temp),target,c) not in replies)) 
+                 #Copied this from churn9-20.da
+            
+            # We block further execution with await()
+            # so we test a single iteration at a time,
+            # instead of having all operations go at once,
+            # and also falling through into the main algorithm loop
+            endTime = time.time()
+            operationTimes.append(endTime - startTime)
+            
+        averageOperationTime = sum(operationTimes) / len(operationTimes)
+        averageMessageDelay = averageOperationTime / 4
+        
+        output("Average real_message_delay =", averageMessageDelay)
+        DELAY = averageMessageDelay + PADDING
+        output("Setting DELAY = ", DELAY)
+        
+        #Cleanup code for calibration
+        self.numEvents = 0 #Reset the event counter
+        #to account for these extra 5 reads
+        
+        #Enable stalling at all nodes
+        send("enable stalling", to = nodes)
+        
+    
+    def run():
+        #output("Initial nodes", nodes)
+        
+        output("Calibrating DELAY value")
+        calibrateDelay()
+        output("Beginning main loop of the algorithm")
+        
+        #main loop
+        for i in range(0, NUM_OPERATIONS):
+            output("Iteration", i, "time.time()", time.time())
+            
+            #Determine which operations can be done at this time
+            #(For example, can't crash if crash rate is too high, etc)
+            #"read", "write", "enter", "leave", "crash"
+            opList = ["read", "write"] #default allow read, write
+            churnAllowed = calculateChurnAllowed()
+            crashAllowed = calculateCrashAllowed()
+            
+            if churnAllowed:
+                opList.append("enter") #allow enter
+            if crashAllowed:
+                opList.append("crash") #allow crashing
+            if churnAllowed and crashAllowed:
+                opList.append("leave") #allow leaving
+                #if numCrashes > delta, we disallow leaving (as that would make
+                #the percentage of crashed nodes bigger)
+            
+            output("Iteration", i, "allowed operations", str([opList]))
+            #From the operations, select one that can be done
+            opChoice = localRandom.choice(opList)
+            
+            #Update the churn history
+            if opChoice == "enter":
+                churnHistory.append( (time.time(), len(nodes)+1) )
+            elif opChoice == "leave":
+                churnHistory.append( (time.time(), len(nodes)-1) )
+            
+            #execute the operation chosen, and choose a target for it
+            #R/W: nodes-crashed-busy (don't invoke on busy nodes)
+            #Crash/Leave: nodes-crashed 
+            #(allow busy nodes to crash in the middle of r/w)
+            
+            #python note: set of potential targets must be list
+            #or random.choice breaks
+            try:
+                writeValueOutput = "not used" #Just for console logging
+                if opChoice == "read":
+                    target = random.choice(list(nodes - crashed - busy)) 
+                    do_read(target)
+                elif opChoice == "write":
+                    target = random.choice(list(nodes - crashed - busy)) 
+                    do_write(target, writeValue)
+                    writeValueOutput = self.writeValue
+                    self.writeValue += 1 #Ensure uniqueness of write values
+                elif opChoice == "enter":
+                    target = "not used"
+                    do_enter()
+                elif opChoice == "leave":
+                    target = random.choice(list(nodes - crashed)) 
+                    do_leave(target)
+                elif opChoice == "crash":
+                    target = random.choice(list(nodes - crashed)) 
+                    do_crash(target)
+                output("ITER:", i, "| op:", opChoice, 
+                "| writeValue:", writeValueOutput, "| target:", str(target))
+            except IndexError as e:
+                output("ITER:", i, "Tried op:", opChoice, 
+                "but all nodes were busy")
+                
+            
+            #Wait a random amt of time before scheduling next op
+            waitTime = localRandom.uniform(MIN_TIME_TO_NEXT_OP, MAX_TIME_TO_NEXT_OP)
+            if await(False): pass
+            elif timeout(waitTime): pass
+            
+            
+        #ENDFOR
+        
+        #After scheduling all events, the Scheduler waits 
+        #impatiently for all events to finish
+        #if await(numEvents >= NUM_OPERATIONS): pass
+        await(numEvents >= NUM_OPERATIONS)
+        #elif timeout(NUM_OPERATIONS * 5): #[NEW]
+        #    output("Simulation timed out, numEvents =", numEvents)
+        output("All events finished, exiting")
+        send('end-sim', to=nodes)
+        exit()
+        
+    #Code for handling enter events
+    #Start
+    def do_enter():
+        p = new(Node, [set(), self])
+        output("Beginning join on new node", p)
+        start(p)
+        nodes.add(p)
+    
+    #Finish
+    def receive(msg = 'joined', from_ = p):
+        output("node", p, "join finished")
+        numEvents += 1
+
+    #Code for handling leave events
+    def do_leave(p):
+        send('leave-signal', to= p)
+        nodes.remove(p)
+        #[NEW] if p leaves in the middle of a read/write,
+        #it'll never finish read/writing...
+        #we need to manually account for the missing event
+        #for the sim to exit gracefully.
+        
+        if p in busy: #Add an aborted read/write to the event counter
+            numEvents+=1
+        
+        #we also add the leave itself to the event counter
+        numEvents += 1
+ 
+    #Code for handling read events
+    #Start
+    def do_read(p):
+        output("Begin read with node", p)
+        busy.add(p) #Add node p to busy set, so we don't call more reads/writes on p while it's working
+        send('read', to= p)
+    
+    #Finish
+    def receive( msg = ('return', m), from_ = p ):
+        #[NEW] tweaked output stmt to include time
+        output("read on node", p, "returns with value", m, 
+               "time finish", time.time())
+        busy.remove(p) #p done read/writing
+        numEvents += 1
+
+    #Code for handling write events
+    def do_write(p,val):
+        output("Begin write with node", p)
+        busy.add(p) #As with do_read, add node p to the busy set
+        send(('write',val), to= p)
+        
+    #Finish
+    def receive( msg = 'ack', from_ = p ):
+        #[NEW] tweaked output statement
+        output('write on node', p, 'returns with ack',
+               "time finish", time.time())
+        busy.remove(p)
+        numEvents += 1
+    
+    #Code for handling crash events
+    def do_crash(p):
+        output('Crashing node', p)
+        #if p was in busyset, that means it was
+        #in the middle of a read/write operation ...
+        #Since we crash it, it'll never finish read/writing).
+        #we need to manually account for the missing event
+        #for the sim to exit gracefully.
+        
+        if p in busy: #Add an aborted read/write to the event counter
+            numEvents+=1
+            #output('DEBUG, busy branch tripped', numEvents)
+        
+        #we also add the crash itself to the event counter
+        crashed.add(p)
+        numEvents += 1
+            
+
+# ----------------------------------------
+# main
+# ----------------------------------------
+
+def main():
+    #config(clock = Lamport)
+    
+    #NEW! Trying to avoid recursionexception
+    output("Setting recursion limit")
+    sys.setrecursionlimit(10**6) #Tweak this number
+
+    output("Simulation started at", time.time())
+    output("CONFIG")
+    output("ALPHA", ALPHA)
+    output("DELTA", DELTA)
+    output("NUM_INIT_NODE", NUM_INIT_NODE)
+    output("GAMMA", GAMMA)
+    output("BETA", BETA)
+    output("PADDING", PADDING)
+    output("MIN_TIME_TO_NEXT_OP", MIN_TIME_TO_NEXT_OP)
+    output("MAX_TIME_TO_NEXT_OP", MAX_TIME_TO_NEXT_OP)
+    output("NUM_OPERATIONS", NUM_OPERATIONS)
+    scheduler = new(Scheduler, [])
+    start(scheduler)
