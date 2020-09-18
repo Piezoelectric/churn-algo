@@ -1,0 +1,307 @@
+import random
+import time
+
+BETA = 0.6
+GAMMA = 0.6
+NTRIES = 1
+NUM_INIT_NODE = 3
+
+# ----------------------------------------
+# Node class
+# ----------------------------------------
+
+class Node (process):
+  def setup(known_nodes, scheduler): # for initial node, known_nodes is
+         # all the other initial nodes; otherwise it is empty set
+
+    # **** variables for managing churn ****
+    self.is_joined = bool(known_nodes) # whether node has joined the system
+    self.join_bound = 0 # number of enter-echo msgs to receive
+                        # before joining
+    self.join_counter = 0 # number of enter-echo messages received
+    self.Changes = (setof(('enter',q), q in known_nodes) | 
+                    setof(('join',q), q in known_nodes))  # set of ENTER, 
+                                   #LEAVE, and JOINED events known to node 
+    if (known_nodes):  # self is one of the initial nodes
+        Changes.add(('enter',self))
+        Changes.add(('join',self))
+
+    # *** variables for managing churn and reading/writing simulated register
+    self.val = None # latest register value known to node
+    self.num = 0 # sequence number of latest value known to node
+    self.w_id = None  # id of node that wrote latest value known to node
+
+    # **** variables for reading/writing simulated register ****
+    self.temp = 0 # temporary storage for value being read or written
+    self.tag = 0  # uniquely identify read and write phases of an operation
+    self.rw_bound = 0 # number of replies/acks needed to finish a phase
+    self.rw_counter = 0  # number of replies/acks received for phase
+    self.rp_pending = False # whether a read phase is in progress
+    self.wp_pending = False # whether a write phase is in progress
+    self.read_pending = False #  whether a read operation is in progress
+    self.write_pending = False # whether a write operation is in progress
+
+    # code for node entering the system AFTER initial time, in response
+    # to receiving enter-signal message from scheduler
+    if known_nodes == set():
+        Changes.add(('enter',self))
+        bcast('enter', self)
+        output('entered, bcasted enter msgs')
+
+  # ********** end of Node setup method 
+
+  # broadcast is actually peformed by scheduler which has perfect global
+  # knowledge of which nodes are present in the system
+  def bcast(*m):
+      send(('bcast',m), to=scheduler)
+
+  # ***************** methods for managing the churn ******************
+
+  # set of nodes that p believes are currently present (entered but not left) 
+  def Present():
+      return setof(q, ('enter',q) in Changes, ('leave',q) not in Changes)
+
+  def receive(msg = ('enter',p)):
+      Changes.add(('enter',p))
+      bcast('enter-echo', Changes, (val, num, w_id), is_joined, p)
+
+  def receive(msg = ('enter-echo', C, (v, s, i), j, p)):
+      if (s, i) > (num, w_id, id):
+          val, num, w_id = v, s, i
+      Changes = Changes | C
+      if (not is_joined) and (p == self):
+          if (j == True) and (join_bound == 0):
+              join_bound = GAMMA * len(Present())
+              output('join_bound set to', join_bound, 'based on Present size of', len(Present()))
+          join_counter += 1
+          if (join_counter >= join_bound) and (join_bound > 0):
+              is_joined = True
+              output('joined')
+              Changes.add(('join',self))
+              send(('joined'), to=scheduler) # tell scheduler I've joined
+              bcast('joined',self)
+
+  def receive(msg = ('joined', p)):
+      Changes.add(('join',p))
+      Changes.add(('enter',p))
+      bcast('joined-echo',p)
+
+  def receive(msg = ('joined-echo',p)):
+      Changes.add(('join',p))
+      Changes.add(('enter',p))
+
+  # node leaves in response to 'leave-signal' msg from scheduler
+  def receive(msg = ('leave-signal')): 
+      output('received leave signal, exiting')
+      bcast('leave', self)
+      output('exiting')
+      exit()
+
+  def receive(msg = ('leave',p)):
+      Changes.add(('leave',p))
+      bcast('leave-echo',p)
+#      output('received leave message from node',p,'Changes set is',Changes)
+
+  def receive(msg = ('leave-echo',p)):
+      Changes.add(('leave',p))
+
+  # ***************** methods for simulating reads and writes **************
+
+  # set of nodes that p believes are currently members (joined but not left) 
+  def Members():
+    return setof(q, ('join',q) in Changes, ('leave',q) not in Changes)
+
+  def receive(msg='read'):
+      output('read invoked')
+      read_pending = True
+      begin_read_phase()
+
+  def receive(msg = ('write', v)):
+      output('write invoked, value:', v)
+      write_pending = True
+      temp = v
+      begin_read_phase()
+
+  def begin_read_phase():
+      output('begin read phase')
+      tag += 1
+      bcast('query', tag, self)
+      rw_bound = BETA * len(Members())
+      output('rw_bound set to', rw_bound, 'based on Members size of', len(Members()))
+      rw_counter = 0
+      rp_pending = True
+
+  def receive(msg = ('reply', (v, s, i), rt, p)):
+#     output('====reply', rt)
+      if rp_pending and (rt == tag) and (p==self):
+          if (s, i) > (num, w_id):
+              val, num, w_id = v, s, i
+          rw_counter += 1
+          if (rw_counter >= rw_bound):
+              rp_pending = False
+              begin_write_phase()
+
+  def begin_write_phase():
+      output('begin write phase')
+      if write_pending:
+          val = temp
+          num += 1
+          w_id = self
+      if read_pending:
+          temp = val
+      bcast('update', (temp, num, w_id), tag, self)
+      rw_counter = 0
+      wp_pending = True
+
+  def receive(msg = ('ack',wt,p)):
+      if wp_pending and (wt == tag) and (p == self):
+          rw_counter += 1
+          if (rw_counter >= rw_bound):
+              wp_pending = False
+              if (read_pending):
+                  read_pending = False
+                  send(('return',temp), to=scheduler)
+              if (write_pending):
+                  write_pending = False
+                  send('ack', to=scheduler)
+
+  # ***** "server" code follows ****
+
+  def receive(msg= ('update', (v, s, i), wt, q)):
+    if w_id == None or (s, i) > (num, w_id):
+       val, num, w_id = v, s, i
+    if is_joined:
+       bcast('ack', wt, q)
+    bcast('update-echo', (val, num, w_id))
+
+  def receive(msg = ('query', rt, p)):
+#    print('====qeury', p, is_joined)
+    if is_joined:
+#      print('====qeury', p)
+      bcast('reply', (val, num, w_id), rt, p)
+
+  def receive(msg = ('update-echo', (v, s, i))):
+    if (s, i) > (num, w_id):
+        val, num, w_id = v, s, i
+
+  def receive(msg= 'done'):
+    output('exiting by done')
+    exit()
+
+# ********** run *******************************
+
+  def run():
+#    output(self, 'running')
+    await(False)
+    output('node', self, 'at end of run')
+
+# ----------------------------------------
+# Scheduler class
+# ----------------------------------------
+
+class Scheduler (process):
+  def setup():
+      self.nodes = new(Node, num=NUM_INIT_NODE)
+      for p in nodes: setup(p, [nodes-{p}, self])
+      start(nodes)
+
+      output('nodes present initially are', nodes)
+
+      self.replies = set()
+
+  def run():
+
+#     for i in range(NTRIES):
+      p = random.choice(list(nodes))
+      output('randomly chosen node is', p)
+
+#      test_read(p)
+#      test_write(p,37)
+#      test_read(p,)
+      test_leave(p)
+      test_enter()
+      test_enter()
+      test_enter()
+
+      p = random.choice(list(nodes))
+      output('randomly chosen node is', p, 'to write 12')
+      test_write(p,12)
+      output('test_write')
+
+      p = random.choice(list(nodes))
+      output('randomly chosen node is', p, 'to read')
+      test_read(p)
+
+      await(received('done'))
+      output('scheduler terminating')
+
+  def test_leave(p):
+      send('leave-signal', to= p)
+      nodes.remove(p)
+
+  def test_enter():
+      p = new(Node, [set(), self])
+      start(p)
+      nodes.add(p)
+      await(some(received('joined', from_=_p, clk=c),
+                 has= ('joined',p,c) not in replies))
+      output('join completed indication received', p, c)
+      replies.add(('joined',p,c))
+
+  def test_read(p):
+      send('read', to= p)
+      await(some(received(('return',temp), from_=_p, clk=c),
+                 has= (('return',temp),p,c) not in replies))
+      output('----waited', p, c)
+      replies.add((('return',temp),p,c))
+      output('read returns with value ', temp)
+
+  def test_write(p,val):
+      output('test write start')
+      send(('write',val), to= p)
+      await(some(received('ack', from_=_p, clk=c),
+                 has= ('ack',p,c) not in replies))
+      output('write returns with ack', p, c)
+      replies.add(('ack',p,c))
+
+  def receive(msg = ('bcast',m)):
+      send(m, to=nodes)
+
+  def receive(msg = 'done'):
+      output('done received by scheduler')
+      send('done', to= nodes)
+      #end(nodes)
+      output('scheduler sent done msgs to nodes', nodes)
+
+# ----------------------------------------
+# main
+# ----------------------------------------
+
+def main():
+  config(clock = Lamport)
+
+  scheduler = new(Scheduler, [])
+  start(scheduler)
+
+  time.sleep(3)
+  send('done', to= scheduler)
+
+#  apps = new(App, num=nnode)
+#  for c,a in zip(list(clients), list(apps)):
+#      setup(a, [c])
+#  #lower level
+#   clients = set()
+#   apps = set()
+#   for i in range(10):
+#     c = new(Client)
+#     a = new(App, [c])
+#     clients.add(c)
+#     apps.add(a)
+
+#  systems of entities/robots
+#  each is a app, client, and server (all servers)
+#  join
+#  view
+#  simulated register
+#  read and write
+#  leave
