@@ -1,42 +1,53 @@
 import random
 import time
+from datetime import datetime #just for knowing when the sim started
 import sys
+
+# Goal/changes for this file:
+# -Adjust the timing model
+# -Figure out what a good number of operations to run is
 
 # ----
 # Params
 # ----
 
-NUM_INIT_NODE = 10   # Churn rate 0.03 * 33 init nodes = 1 churn event allowed at start
-NUM_OPERATIONS = 10  # num operations the simulator should schedule
+NUM_INIT_NODE = 50   # Churn rate 0.03 * 33 init nodes = 1 churn event allowed at start
+NUM_OPERATIONS = 50  #Number of operations the simulator should schedule
 
 # Parameter set: alpha 0.03, delta 0.13, gamma 0.7, beta 0.726
 
 BETA = 0.726    #% of nodes believed to be joined (members)
 GAMMA = 0.70    #% of nodes believed to be present (not necessarily joined)
 ALPHA = 0.03    #Churn rate
-DELTA = 0.13       #failure fraction / Max % of nodes that can be crashed
+DELTA = 0       #failure fraction / Max % of nodes that can be crashed
 
 # ----
 # Randomized delays
 # ----
 
 MIN_TIME_TO_NEXT_OP = 0.5
-MAX_TIME_TO_NEXT_OP = 1
+MAX_TIME_TO_NEXT_OP = 5
 #In the scheduler/simulator,
 #the min/max amount of real time to wait until triggering another operation/event
 
-# Maximum message delay: defined as D in the paper, DELAY in the code.
+#We would like some operations to finish before the next ones are scheduled,
+#(if they're all scheduled before any finish, they all overlap--not interesting)
+#But not ALL of them finish before the next is scheduled
+#(if every op finishes before the next one starts, then its completely linear
+#--not interesting either)
+
+# Maximum message delay (defined as D in the paper, DELAY in the code).
 # We consider maximum message delay
 # To be the sum of (real_message_delay) + (a random amount of padding).
 # We only care about delays in between node-node communication;
 # not delays in between node-scheduler communication
 # cause the scheduler isn't a real entity in the algorithm itself.
 
-# D is used by the algorithm,
+# Note that D is used by the algorithm,
 # To determine how long the 'sliding window' for past churn events should be.
 # We want DELAY to be big enough so the sliding window of churn history
-# can capture recent churn events,
-# But small enough that the program doesn't stall forever.
+# Can capture recent churn events,
+# But small enough that the program runs to completion.
 
 # Padding is a random amount of time (from 0 to PADDING) added onto 
 # node-node communications.
@@ -63,7 +74,11 @@ MAX_TIME_TO_NEXT_OP = 1
 # (Why 4? The total runtime is 4*D because of two round trips.
 # The read phase is 2*D, the write phase is 2*D).
 
-PADDING = 2
+PADDING = 3
+_PADDING = 0
+# We set _PADDING = 0 at first (for determining real_message_delay),
+# Then set _PADDING = PADDING (for the actual algorithm)
+
 
 # ----
 # Other comments
@@ -73,7 +88,7 @@ PADDING = 2
 #each scheduler event triggers one operation on the system
 
 #scheduler and simulator are the same thing,
-#the simulator schedules/invokes/starts each event
+#the simulator schedules each event
 
 #Flags: TODO, ASKABOUT, NEW, 
 #RIGGED (code which changes algo behavior on purpose, to test a particular code branch)
@@ -131,11 +146,6 @@ class Node (process):
         self.localRandom = random.Random()
         # Optional: seed local_random if desired
         
-        self.stallingEnabled = False
-        #By default a node starts with stall() disabled;
-        #this is so we can accurately measure real-time message delays
-        #without our manually induced delays (see note at top of file).
-        
     # ********** end of Node setup method 
 
     # broadcast is actually performed by scheduler which has perfect global
@@ -145,21 +155,11 @@ class Node (process):
         
     # **** helper method for simulating random message delays
     def stall():
-        if stallingEnabled:
-            waitTime = localRandom.uniform(0,PADDING)
-            if await(False): pass
-            elif timeout(waitTime): 
-                #output("DEBUG -- stall timeout for node", self)
-                pass
-                
-    
-    #Method which enables stalling.
-    #By default a node starts with stall() disabled;
-    #this is so we can accurately measure real-time message delays
-    #without our manually induced delays (see note at top of file).
-    def receive(msg = "enable stalling"):
-        output("Stalling Enabled")
-        self.stallingEnabled = True
+        waitTime = localRandom.uniform(0,_PADDING)
+        if await(False): pass
+        elif timeout(waitTime): 
+            #output("DEBUG -- stall timeout for node", self)
+            pass
     
     # ***************** methods for managing the churn ******************
 
@@ -229,7 +229,7 @@ class Node (process):
         #output('read invoked')
         read_pending = True
         begin_read_phase()
-    
+
     #Scheduler kicks off a write event
     def receive(msg = ('write', v)):
         #output('write invoked, value:', v)
@@ -281,7 +281,7 @@ class Node (process):
                 if (write_pending):
                     write_pending = False
                     send('ack', to=scheduler)
-                    
+
     # ***** "server" code follows ****
     #Server as defined in the paper. It's not the scheduler.
 
@@ -352,7 +352,7 @@ class Scheduler (process):
         self.numEvents = 0
         
         #Bookkeeping so each write has a unique value
-        self.writeValue = 0 
+        self.writeValue = 1
         
         #Initialize self.DELAY = 0, but change it
         #Once we've finished calibrating what DELAY should be,
@@ -393,6 +393,7 @@ class Scheduler (process):
             numChurns = index + 1   #Index = # of churn events in the past (1-indxed),
                                     #+1 to add the hypothetical churn event at current time
             sysSize = churn[1]      #Historical system size, not current
+            #sysSize = 3000 #RIGGED to test this branch
             potentialChurnPercent = numChurns/sysSize
             output("[calculateChurnAllowed] potential churn%", numChurns, "/", 
                    sysSize, "=", potentialChurnPercent, "|", "alpha=", ALPHA)
@@ -418,11 +419,16 @@ class Scheduler (process):
         send(m, to = nodes-crashed)
         
     
-    def calibrateDelay():
+    def run():
+        #output("Initial nodes", nodes)
+        
+        
         # Calibrate DELAY value based on how long an average operation takes
         # on this particular computer
+        output("Calibrating DELAY value")
         operationTimes = []
-        for i in range(2):
+        NUM_CALIBRATIONS = 5
+        for i in range(NUM_CALIBRATIONS):
             startTime = time.time()
             target = random.choice(list(nodes - crashed))
             do_read(target)
@@ -445,18 +451,9 @@ class Scheduler (process):
         output("Setting DELAY = ", DELAY)
         
         #Cleanup code for calibration
-        self.numEvents = 0 #Reset the event counter
+        _PADDING = PADDING #Setting stall() to use actual padding instead of 0 padding
+        numEvents = 0 #Reset the event counter
         #to account for these extra 5 reads
-        
-        #Enable stalling at all nodes
-        send("enable stalling", to = nodes)
-        
-    
-    def run():
-        #output("Initial nodes", nodes)
-        
-        output("Calibrating DELAY value")
-        calibrateDelay()
         output("Beginning main loop of the algorithm")
         
         #main loop
@@ -481,7 +478,15 @@ class Scheduler (process):
             
             output("Iteration", i, "allowed operations", str([opList]))
             #From the operations, select one that can be done
-            opChoice = localRandom.choice(opList)
+            #RIGGED code to test crash resilience bound
+            if i < 14:
+                opChoice = "crash"
+            else:
+                opChoice = localRandom.choice(["read", "write"])
+            #Selecting a target depends on the operation
+            
+            
+            
             
             #Update the churn history
             if opChoice == "enter":
@@ -532,10 +537,9 @@ class Scheduler (process):
         
         #After scheduling all events, the Scheduler waits 
         #impatiently for all events to finish
-        #if await(numEvents >= NUM_OPERATIONS): pass
-        await(numEvents >= NUM_OPERATIONS)
-        #elif timeout(NUM_OPERATIONS * 5): #[NEW]
-        #    output("Simulation timed out, numEvents =", numEvents)
+        if await(numEvents == NUM_OPERATIONS): pass
+        elif timeout(NUM_OPERATIONS * 5): #[NEW]
+            output("Simulation timed out, numEvents =", numEvents)
         output("All events finished, exiting")
         send('end-sim', to=nodes)
         exit()
@@ -626,7 +630,7 @@ def main():
     output("Setting recursion limit")
     sys.setrecursionlimit(10**6) #Tweak this number
 
-    output("Simulation started at", time.time())
+    output("Simulation started at", datetime.now())
     output("CONFIG")
     output("ALPHA", ALPHA)
     output("DELTA", DELTA)
